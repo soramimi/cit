@@ -21,6 +21,7 @@ type Commit struct {
 	IsUncommitted bool   // 未コミットの変更を表すフラグ
 	Branch        string // コミットが属するブランチ名
 	BranchLoaded  bool   // ブランチ情報が読み込まれたかどうか
+	IsHead        bool   // HEADを指しているかどうか
 }
 
 // ブランチ情報のキャッシュ用マップとミューテックス
@@ -84,6 +85,28 @@ func getUncommittedChangesSummary() (string, error) {
 	}
 
 	return fmt.Sprintf("%d files changed", numChanges), nil
+}
+
+// 現在のHEADのコミットハッシュを取得
+func getHeadCommitHash() (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(output)), nil
+}
+
+// ブランチのコミットハッシュを取得
+func getBranchCommitHash(branchName string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", branchName)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(output)), nil
 }
 
 // コミットが属するブランチを取得（キャッシュを活用）
@@ -178,23 +201,34 @@ func loadBranchInfoAsync(commit *Commit) {
 	}(commit)
 }
 
-// コミットをチェックアウトする
+// コミットをチェックアウトする - switchとcheckoutを適切に使い分ける
 func checkoutCommit(commit Commit) (string, error) {
-	var cmd *exec.Cmd
-
-	// ブランチが存在する場合はそのブランチに切り替え、そうでない場合は直接コミットをチェックアウト
+	// ブランチ名が存在する場合、ブランチのHEADとコミットハッシュを比較
 	if commit.Branch != "" {
-		cmd = exec.Command("git", "checkout", commit.Branch)
-	} else {
-		cmd = exec.Command("git", "checkout", commit.Hash)
+		branchHash, err := getBranchCommitHash(commit.Branch)
+		if err == nil && branchHash == commit.Hash {
+			// ブランチのHEADとコミットハッシュが一致する場合はswitchを使用
+			cmd := exec.Command("git", "switch", commit.Branch)
+			output, err := cmd.CombinedOutput()
+			return string(output), err
+		}
 	}
 
+	// ブランチが存在しない場合、または一致しない場合はcheckoutでハッシュを指定
+	cmd := exec.Command("git", "checkout", commit.Hash)
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
 
 // Gitコミットログを取得
 func getGitCommits() ([]Commit, error) {
+	// 現在のHEADのハッシュを取得
+	headHash, err := getHeadCommitHash()
+	if err != nil {
+		// エラーがあってもプロセスは続行（HEADのハイライトができないだけ）
+		headHash = ""
+	}
+
 	// 日時をGitの標準形式で取得
 	cmd := exec.Command("git", "log", "--all", "--pretty=format:%H|%an|%ad|%s")
 	output, err := cmd.Output()
@@ -214,7 +248,8 @@ func getGitCommits() ([]Commit, error) {
 				Date:          formatDate(parts[2]),
 				Message:       formatMessage(parts[3]),
 				IsUncommitted: false,
-				BranchLoaded:  false, // 初期状態では未ロード
+				BranchLoaded:  false,            // 初期状態では未ロード
+				IsHead:        hash == headHash, // HEADかどうかをチェック
 			}
 
 			commits = append(commits, commit)
@@ -349,21 +384,24 @@ func main() {
 				display = display[:width]
 			}
 
-			// 選択中のコミットは反転表示、それ以外は通常表示
+			// 表示スタイルの適用
 			if i == currentCommit {
+				// 現在選択されている行
 				if commit.IsUncommitted {
 					// 未コミットの変更を選択中の場合は特別な表示
 					fmt.Fprintf(textView, "[black:yellow]%s[-:-]\n", display)
 				} else {
 					fmt.Fprintf(textView, "[black:white]%s[-:-]\n", display)
 				}
+			} else if commit.IsHead {
+				// HEADを指しているコミットは黄色で表示
+				fmt.Fprintf(textView, "[yellow]%s[-:-]\n", display)
+			} else if commit.IsUncommitted {
+				// 未コミットの変更は強調表示
+				fmt.Fprintf(textView, "[yellow]%s[-:-]\n", display)
 			} else {
-				if commit.IsUncommitted {
-					// 未コミットの変更は強調表示
-					fmt.Fprintf(textView, "[yellow]%s[-:-]\n", display)
-				} else {
-					fmt.Fprintf(textView, "%s\n", display)
-				}
+				// 通常のコミット
+				fmt.Fprintf(textView, "%s\n", display)
 			}
 		}
 
@@ -517,12 +555,23 @@ func main() {
 		return false // 通常の描画処理を継続
 	})
 
-	// 定期的に画面更新を行うタイマー（ブランチ情報が非同期でロードされるため）
+	// 定期的に画面更新とHEADの位置更新を行うタイマー
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
 		for range ticker.C {
 			app.QueueUpdateDraw(func() {
-				// 選択中のコミットのブランチ情報だけを更新（負荷軽減）
+				// 最新のHEADの位置を取得
+				headHash, err := getHeadCommitHash()
+				if err == nil {
+					// HEADの位置を更新
+					for i := range commits {
+						if !commits[i].IsUncommitted {
+							commits[i].IsHead = (commits[i].Hash == headHash)
+						}
+					}
+				}
+
+				// 画面を更新
 				if currentCommit >= 0 && currentCommit < len(commits) {
 					displayCommits()
 				}
