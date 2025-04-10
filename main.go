@@ -412,7 +412,31 @@ func main() {
 		statusArea.Clear()
 		if confirmMode && !commits[currentCommit].IsUncommitted {
 			// 確認モード時: コミットチェックアウト確認メッセージを表示
-			checkoutMsg := fmt.Sprintf("Checkout commit %s? [y/n]", commits[currentCommit].Hash[:7])
+			commit := commits[currentCommit]
+
+			// チェックアウトするときのモード（ブランチswitchかdetached headか）を判定
+			isDetachedHead := true
+			branchToSwitch := ""
+			if commit.Branch != "" {
+				// ブランチのHEADとコミットハッシュを比較
+				branchHash, err := getBranchCommitHash(commit.Branch)
+				if err == nil && branchHash == commit.Hash {
+					// ブランチのHEADとコミットハッシュが一致する場合
+					isDetachedHead = false
+					branchToSwitch = commit.Branch
+				}
+			}
+
+			// メッセージ作成
+			var checkoutMsg string
+			if isDetachedHead {
+				// detached headになる場合
+				checkoutMsg = fmt.Sprintf("Checkout commit %s? (detached HEAD) [y/n]", commit.Hash[:7])
+			} else {
+				// ブランチにswitchする場合
+				checkoutMsg = fmt.Sprintf("Checkout branch '%s'? [y/n]", branchToSwitch)
+			}
+
 			statusArea.Write([]byte(checkoutMsg))
 		} else {
 			// 通常時: コミット総数の表示
