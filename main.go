@@ -98,6 +98,21 @@ func getHeadCommitHash() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// 現在のHEADが指しているブランチ名を取得する
+func getCurrentBranchName() (string, bool) {
+	// git symbolic-ref --short HEAD でブランチ名を取得
+	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	output, err := cmd.Output()
+
+	// エラーの場合はdetached HEAD状態
+	if err != nil {
+		return "", false
+	}
+
+	// ブランチ名を返す
+	return strings.TrimSpace(string(output)), true
+}
+
 // ブランチのコミットハッシュを取得
 func getBranchCommitHash(branchName string) (string, error) {
 	cmd := exec.Command("git", "rev-parse", branchName)
@@ -148,6 +163,30 @@ func getCommitBranch(hash string) string {
 	branchCacheLock.Unlock()
 
 	return foundBranch
+}
+
+// コミットが属する複数のブランチリストを取得
+func getCommitBranches(hash string) []string {
+	cmd := exec.Command("git", "branch", "--contains", hash)
+	output, err := cmd.Output()
+	if err != nil {
+		return []string{} // エラーの場合は空のスライスを返す
+	}
+
+	var branches []string
+	for _, branch := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		branch = strings.TrimSpace(branch)
+		// "*" で始まる場合はカレントブランチを示す
+		if strings.HasPrefix(branch, "*") {
+			branch = strings.TrimSpace(strings.TrimPrefix(branch, "*"))
+		}
+
+		if branch != "" {
+			branches = append(branches, branch)
+		}
+	}
+
+	return branches
 }
 
 // 一括でブランチマッピングを取得（高速化のため）
@@ -218,6 +257,37 @@ func checkoutCommit(commit Commit) (string, error) {
 	cmd := exec.Command("git", "checkout", commit.Hash)
 	output, err := cmd.CombinedOutput()
 	return string(output), err
+}
+
+// コミット情報をリフレッシュする関数（ブランチ切り替え後に呼び出す）
+func refreshCommitInfo(commits []Commit) {
+	// ブランチ情報をクリアして再取得するように設定
+	branchCacheLock.Lock()
+	for k := range branchCache {
+		delete(branchCache, k)
+	}
+	branchCacheLock.Unlock()
+
+	// コミットのブランチ情報をリセット
+	for i := range commits {
+		if !commits[i].IsUncommitted {
+			commits[i].Branch = ""
+			commits[i].BranchLoaded = false
+		}
+	}
+
+	// ブランチ情報を非同期で再取得
+	getBranchesForCommits(commits)
+
+	// HEADの位置も更新
+	headHash, err := getHeadCommitHash()
+	if err == nil {
+		for i := range commits {
+			if !commits[i].IsUncommitted {
+				commits[i].IsHead = (commits[i].Hash == headHash)
+			}
+		}
+	}
 }
 
 // Gitコミットログを取得
@@ -329,8 +399,17 @@ func main() {
 	// スクロール位置の管理（先頭からの行オフセット）
 	scrollOffset := 0
 
-	// 確認モードのフラグ
+	// 確認モードとブランチ選択モードのフラグ
 	confirmMode := false
+	branchSelectMode := false
+	confirmAfterBranchSelect := false // ブランチ選択後の確認モードフラグ
+
+	// チェックアウト操作の状態
+	isDetachedHeadMode := false // detached headモードかどうか
+
+	// ブランチ選択用の変数
+	var availableBranches []string
+	currentBranchIndex := 0
 
 	// コミットを表示する関数
 	displayCommits := func() {
@@ -375,9 +454,6 @@ func main() {
 
 			// 表示形式を変更: ハッシュ - 日付 - 作者 - メッセージ
 			display := fmt.Sprintf("%s - %s - %s - %s", commit.Hash[:7], commit.Date, commit.Author, commit.Message)
-			if commit.Branch != "" {
-				display += fmt.Sprintf(" [%s]", commit.Branch)
-			}
 
 			// 画面幅に合わせて文字列を切り捨て
 			if len(display) > width {
@@ -410,39 +486,47 @@ func main() {
 
 		// ステータスエリアの更新
 		statusArea.Clear()
-		if confirmMode && !commits[currentCommit].IsUncommitted {
+		if branchSelectMode && !commits[currentCommit].IsUncommitted && len(availableBranches) > 0 {
+			// ブランチ選択モード時: 利用可能なブランチを左右矢印で選択できるように表示
+			var branchDisplay string
+			for i, branch := range availableBranches {
+				if i == currentBranchIndex {
+					// 選択中のブランチは強調表示
+					branchDisplay += fmt.Sprintf("[black:white]%s[-:-] ", branch)
+				} else {
+					branchDisplay += fmt.Sprintf("%s ", branch)
+				}
+			}
+			// 右矢印や左矢印キーで選択することを示唆
+			statusArea.Write([]byte(fmt.Sprintf("Select branch to checkout (←→ to move, Enter to confirm): %s", branchDisplay)))
+		} else if confirmMode && !commits[currentCommit].IsUncommitted {
 			// 確認モード時: コミットチェックアウト確認メッセージを表示
 			commit := commits[currentCommit]
 
-			// チェックアウトするときのモード（ブランチswitchかdetached headか）を判定
-			isDetachedHead := true
-			branchToSwitch := ""
-			if commit.Branch != "" {
-				// ブランチのHEADとコミットハッシュを比較
-				branchHash, err := getBranchCommitHash(commit.Branch)
-				if err == nil && branchHash == commit.Hash {
-					// ブランチのHEADとコミットハッシュが一致する場合
-					isDetachedHead = false
-					branchToSwitch = commit.Branch
-				}
-			}
-
-			// メッセージ作成
 			var checkoutMsg string
-			if isDetachedHead {
+			if isDetachedHeadMode {
 				// detached headになる場合
 				checkoutMsg = fmt.Sprintf("Checkout commit %s? (detached HEAD) [y/n]", commit.Hash[:7])
+			} else if len(availableBranches) > 0 && currentBranchIndex < len(availableBranches) {
+				// ブランチ選択後の確認の場合は、選択されたブランチ名を使用
+				checkoutMsg = fmt.Sprintf("Checkout branch '%s'? [y/n]", availableBranches[currentBranchIndex])
 			} else {
-				// ブランチにswitchする場合
-				checkoutMsg = fmt.Sprintf("Checkout branch '%s'? [y/n]", branchToSwitch)
+				// 通常のブランチにswitchする場合（この条件はほとんど使用されない）
+				checkoutMsg = fmt.Sprintf("Checkout branch '%s'? [y/n]", commit.Branch)
 			}
 
 			statusArea.Write([]byte(checkoutMsg))
 		} else {
-			// 通常時: コミット総数の表示
+			// 通常時: コミット総数と現在のHEADが指すブランチ名の表示
 			branchInfo := ""
-			if currentCommit < len(commits) && commits[currentCommit].Branch != "" {
-				branchInfo = fmt.Sprintf(" (Branch: %s)", commits[currentCommit].Branch)
+			// HEADが指すブランチ名を取得
+			branchName, isAttached := getCurrentBranchName()
+			if isAttached {
+				// ブランチに紐付いている場合はブランチ名を表示
+				branchInfo = fmt.Sprintf(" (Branch: %s)", branchName)
+			} else {
+				// detached HEAD状態の場合はその旨を表示
+				branchInfo = " (detached HEAD)"
 			}
 			statusArea.Write([]byte(fmt.Sprintf("Total commits: %d%s", len(commits), branchInfo)))
 		}
@@ -461,6 +545,47 @@ func main() {
 
 	// キー入力のハンドリング
 	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// ブランチ選択モードの場合
+		if branchSelectMode {
+			switch event.Key() {
+			case tcell.KeyLeft:
+				// 左矢印キー: 前のブランチを選択
+				if currentBranchIndex > 0 {
+					currentBranchIndex--
+					displayCommits()
+				}
+				return nil
+
+			case tcell.KeyRight:
+				// 右矢印キー: 次のブランチを選択
+				if currentBranchIndex < len(availableBranches)-1 {
+					currentBranchIndex++
+					displayCommits()
+				}
+				return nil
+
+			case tcell.KeyEnter:
+				// Enterキー: 選択したブランチを確定し、確認モードに移行
+				branchSelectMode = false
+
+				if confirmAfterBranchSelect && currentBranchIndex >= 0 && currentBranchIndex < len(availableBranches) {
+					// ブランチが選択された後、確認モードに移行
+					confirmAfterBranchSelect = false
+					confirmMode = true
+				}
+
+				displayCommits()
+				return nil
+
+			case tcell.KeyEscape:
+				// Escキー: ブランチ選択モードをキャンセル
+				branchSelectMode = false
+				displayCommits()
+				return nil
+			}
+			return nil
+		}
+
 		// 確認モードの場合、y/n の入力を処理
 		if confirmMode {
 			switch event.Rune() {
@@ -475,8 +600,17 @@ func main() {
 					return nil
 				}
 
-				// チェックアウトを実行
-				output, err := checkoutCommit(commit)
+				var output []byte
+				var err error
+
+				if isDetachedHeadMode {
+					// detached headモードの場合はハッシュを直接チェックアウト
+					output, err = exec.Command("git", "checkout", commit.Hash).CombinedOutput()
+				} else {
+					// ブランチモードの場合は選択したブランチをチェックアウト
+					selectedBranch := availableBranches[currentBranchIndex]
+					output, err = exec.Command("git", "switch", selectedBranch).CombinedOutput()
+				}
 
 				// ステータスエリアに結果を表示
 				statusArea.Clear()
@@ -491,8 +625,27 @@ func main() {
 							shortMsg = shortMsg[:60] + "..."
 						}
 					}
-					statusArea.Write([]byte(fmt.Sprintf("Checkout successful: %s", shortMsg)))
+
+					if isDetachedHeadMode {
+						statusArea.Write([]byte(fmt.Sprintf("Checkout successful (detached HEAD): %s", shortMsg)))
+					} else {
+						statusArea.Write([]byte(fmt.Sprintf("Switched to branch '%s': %s", availableBranches[currentBranchIndex], shortMsg)))
+					}
+
+					// コミット情報をリフレッシュしてブランチ表示を更新
+					refreshCommitInfo(commits)
+
+					// 確実にUI更新を行うため、少し待ってから再度表示を更新
+					go func() {
+						time.Sleep(100 * time.Millisecond)
+						app.QueueUpdateDraw(func() {
+							displayCommits()
+						})
+					}()
 				}
+
+				// 即時の表示更新
+				displayCommits()
 				return nil
 
 			case 'n', 'N':
@@ -545,9 +698,41 @@ func main() {
 			return nil
 
 		case tcell.KeyEnter:
-			// Enter: 確認モードに切り替え（ただし、uncommitted changesの場合は何もしない）
+			// Enter: コミットの選択（ただし、uncommitted changesの場合は何もしない）
 			if !commits[currentCommit].IsUncommitted {
-				confirmMode = true
+				commit := commits[currentCommit]
+
+				// detached headかどうかを判定
+				isDetachedHeadMode = true
+				if commit.Branch != "" {
+					// ブランチのHEADとコミットハッシュを比較
+					branchHash, err := getBranchCommitHash(commit.Branch)
+					if err == nil && branchHash == commit.Hash {
+						// ブランチのHEADとコミットハッシュが一致する場合
+						isDetachedHeadMode = false
+					}
+				}
+
+				if isDetachedHeadMode {
+					// detached head の場合は直接確認モードへ
+					confirmMode = true
+				} else {
+					// 通常のブランチの場合は、まずブランチ選択UIを表示
+					// コミットに関連付けられたすべてのブランチを取得
+					branches := getCommitBranches(commit.Hash)
+
+					if len(branches) > 0 {
+						// ブランチが存在する場合は選択モードを表示
+						availableBranches = branches
+						currentBranchIndex = 0
+						branchSelectMode = true
+						confirmAfterBranchSelect = true // ブランチ選択後に確認モードに入るフラグ
+					} else {
+						// ブランチが存在しない場合は確認モードへ
+						confirmMode = true
+					}
+				}
+
 				displayCommits()
 			}
 			return nil
@@ -559,6 +744,12 @@ func main() {
 	// アプリケーション全体のキー入力のハンドリング
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEscape {
+			// ブランチ選択モード中のEscapeはブランチ選択モードを解除
+			if branchSelectMode {
+				branchSelectMode = false
+				displayCommits()
+				return nil
+			}
 			// 確認モード中のEscapeは確認モードを解除するだけ
 			if confirmMode {
 				confirmMode = false

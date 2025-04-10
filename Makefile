@@ -4,7 +4,7 @@ run:
 	go run .
 
 build:
-	go build -o app
+	go build -o cit
 
 test:
 	go test ./...
