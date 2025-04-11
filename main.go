@@ -454,6 +454,31 @@ func main() {
 
 			// 表示形式を変更: ハッシュ - 日付 - 作者 - メッセージ
 			display := fmt.Sprintf("%s - %s - %s - %s", commit.Hash[:7], commit.Date, commit.Author, commit.Message)
+			
+			// ブランチ名の表示を追加（コミットのハッシュ値とブランチが指すハッシュ値が一致する行のみ）
+			if !commit.IsUncommitted {
+				// そのコミットに関連する全てのブランチを取得
+				branches := getCommitBranches(commit.Hash)
+				var branchesDisplay []string
+				
+				for _, branch := range branches {
+					// 各ブランチについて、そのブランチの先頭コミットかどうか確認
+					branchHash, err := getBranchCommitHash(branch)
+					if err == nil && branchHash == commit.Hash {
+						// ブランチの先頭コミットの場合のみ表示に追加
+						branchesDisplay = append(branchesDisplay, branch)
+					}
+				}
+				
+				// 複数のブランチがある場合は全て表示
+				if len(branchesDisplay) > 0 {
+					branchesStr := " "
+					for _, branch := range branchesDisplay {
+						branchesStr += fmt.Sprintf(" [aqua]{%s}[-]", branch)
+					}
+					display += branchesStr
+				}
+			}
 
 			// 画面幅に合わせて文字列を切り捨て
 			if len(display) > width {
