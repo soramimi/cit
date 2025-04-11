@@ -14,14 +14,17 @@ import (
 
 // コミット情報を格納する構造体
 type Commit struct {
-	Hash          string
-	Author        string
-	Date          string
-	Message       string
-	IsUncommitted bool   // 未コミットの変更を表すフラグ
-	Branch        string // コミットが属するブランチ名
-	BranchLoaded  bool   // ブランチ情報が読み込まれたかどうか
-	IsHead        bool   // HEADを指しているかどうか
+	Hash             string
+	Author           string
+	Date             string
+	Message          string
+	IsUncommitted    bool     // 未コミットの変更を表すフラグ
+	Branch           string   // コミットが属するブランチ名
+	BranchLoaded     bool     // ブランチ情報が読み込まれたかどうか
+	IsHead           bool     // HEADを指しているかどうか
+	Branches         []string // コミットに関連するブランチのリスト
+	HeadBranches     []string // このコミットを指しているブランチのリスト
+	BranchesLoaded   bool     // ブランチリストが読み込まれたかどうか
 }
 
 // ブランチ情報のキャッシュ用マップとミューテックス
@@ -217,26 +220,50 @@ func getBranchesForCommits(commits []Commit) {
 
 // 特定のコミットのブランチ情報を非同期で取得
 func loadBranchInfoAsync(commit *Commit) {
-	if commit.BranchLoaded || commit.IsUncommitted {
+	if (commit.BranchLoaded && commit.BranchesLoaded) || commit.IsUncommitted {
 		return
 	}
 
 	go func(c *Commit) {
-		// キャッシュをチェック
-		branchCacheLock.RLock()
-		branch, exists := branchCache[c.Hash]
-		branchCacheLock.RUnlock()
+		// 単一ブランチ情報のロード
+		if !c.BranchLoaded {
+			// キャッシュをチェック
+			branchCacheLock.RLock()
+			branch, exists := branchCache[c.Hash]
+			branchCacheLock.RUnlock()
 
-		if exists {
-			c.Branch = branch
-			c.BranchLoaded = true
-			return
+			if exists {
+				c.Branch = branch
+				c.BranchLoaded = true
+			} else {
+				// キャッシュになければ取得
+				branch = getCommitBranch(c.Hash)
+				c.Branch = branch
+				c.BranchLoaded = true
+			}
 		}
 
-		// キャッシュになければ取得
-		branch = getCommitBranch(c.Hash)
-		c.Branch = branch
-		c.BranchLoaded = true
+		// ブランチリストの情報をロード
+		if !c.BranchesLoaded {
+			// そのコミットに関連する全てのブランチを取得
+			allBranches := getCommitBranches(c.Hash)
+			c.Branches = allBranches
+			
+			// このコミットを指しているブランチ（HEADブランチ）を特定
+			var headBranches []string
+			
+			for _, branch := range allBranches {
+				// 各ブランチについて、そのブランチの先頭コミットかどうか確認
+				branchHash, err := getBranchCommitHash(branch)
+				if err == nil && branchHash == c.Hash {
+					// ブランチの先頭コミットの場合のみ表示に追加
+					headBranches = append(headBranches, branch)
+				}
+			}
+			
+			c.HeadBranches = headBranches
+			c.BranchesLoaded = true
+		}
 	}(commit)
 }
 
@@ -273,6 +300,9 @@ func refreshCommitInfo(commits []Commit) {
 		if !commits[i].IsUncommitted {
 			commits[i].Branch = ""
 			commits[i].BranchLoaded = false
+			commits[i].Branches = nil
+			commits[i].HeadBranches = nil
+			commits[i].BranchesLoaded = false
 		}
 	}
 
@@ -457,22 +487,40 @@ func main() {
 			
 			// ブランチ名の表示を追加（コミットのハッシュ値とブランチが指すハッシュ値が一致する行のみ）
 			if !commit.IsUncommitted {
-				// そのコミットに関連する全てのブランチを取得
-				branches := getCommitBranches(commit.Hash)
 				var branchesDisplay []string
 				
-				for _, branch := range branches {
-					// 各ブランチについて、そのブランチの先頭コミットかどうか確認
-					branchHash, err := getBranchCommitHash(branch)
-					if err == nil && branchHash == commit.Hash {
-						// ブランチの先頭コミットの場合のみ表示に追加
-						branchesDisplay = append(branchesDisplay, branch)
+				// キャッシュされたブランチ情報があれば使用し、なければ取得
+				if commit.BranchesLoaded {
+					branchesDisplay = commit.HeadBranches
+				} else {
+					// そのコミットに関連する全てのブランチを取得
+					branches := getCommitBranches(commit.Hash)
+					
+					for _, branch := range branches {
+						// 各ブランチについて、そのブランチの先頭コミットかどうか確認
+						branchHash, err := getBranchCommitHash(branch)
+						if err == nil && branchHash == commit.Hash {
+							// ブランチの先頭コミットの場合のみ表示に追加
+							branchesDisplay = append(branchesDisplay, branch)
+						}
+					}
+					
+					// 非同期でキャッシュを更新
+					if !commit.IsUncommitted {
+						loadBranchInfoAsync(&commits[i])
 					}
 				}
 				
-				// 複数のブランチがある場合は全て表示
-				if len(branchesDisplay) > 0 {
+				// ブランチ情報がある場合は表示
+				if len(branchesDisplay) > 0 || commit.IsHead {
 					branchesStr := " "
+					
+					// HEADが指しているコミットの場合は{HEAD}を追加
+					if commit.IsHead {
+						branchesStr += " [aqua]{HEAD}[-]"
+					}
+					
+					// 全てのブランチを表示
 					for _, branch := range branchesDisplay {
 						branchesStr += fmt.Sprintf(" [aqua]{%s}[-]", branch)
 					}

@@ -14,3 +14,6 @@ clean:
 
 setup:
 	go get github.com/rivo/tview
+
+install:
+	install -m 755 cit ~/.local/bin/
